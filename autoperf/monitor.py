@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .logger import warn
+from .process_metrics import select_service_pids
 from .utils import AutoPerfError, ensure_dir, human_time, run_command
 
 
@@ -59,50 +60,23 @@ def _docker_top_rows(container: str) -> list[tuple[str, str, str, str, str]]:
 
 
 def _select_worker_pids(rows: list[tuple[str, str, str, str, str]], workers: int) -> list[str]:
-    candidates: list[tuple[str, int]] = []
-    for pid, _, cpu_flag, elapsed, _ in rows:
-        if not pid.isdigit():
-            continue
-        try:
-            active = int(cpu_flag)
-        except ValueError:
-            active = 0
-        if active <= 0:
-            continue
-        candidates.append((pid, _parse_elapsed_seconds(elapsed)))
-    candidates.sort(key=lambda item: item[1], reverse=True)
-    return [pid for pid, _ in candidates[:workers]]
+    # Keep the legacy argument for callers; worker count never truncates a tree.
+    return [str(pid) for pid in select_service_pids(
+        (pid, ppid, command) for pid, ppid, _, _, command in rows
+    )]
 
 
 def _select_related_pids(rows: list[tuple[str, str, str, str, str]], workers: int) -> set[str]:
-    candidates: list[tuple[str, int]] = []
     children_by_ppid: dict[str, list[str]] = {}
-    command_by_pid: dict[str, str] = {}
-
-    for pid, ppid, cpu_flag, elapsed, command in rows:
-        if not (pid.isdigit() and ppid.isdigit()):
-            continue
+    for pid, ppid, _, _, _ in rows:
         children_by_ppid.setdefault(ppid, []).append(pid)
-        command_by_pid[pid] = command
-        try:
-            active = int(cpu_flag)
-        except ValueError:
-            active = 0
-        if active <= 0:
-            continue
-        candidates.append((pid, _parse_elapsed_seconds(elapsed)))
-
-    candidates.sort(key=lambda item: item[1], reverse=True)
-    roots = [pid for pid, _ in candidates[:workers]]
+    roots = _select_worker_pids(rows, workers)
     related = set(roots)
     stack = list(roots)
     while stack:
         current = stack.pop()
         for child in children_by_ppid.get(current, []):
             if child in related:
-                continue
-            command = command_by_pid.get(child, "")
-            if "gunicorn" not in command:
                 continue
             related.add(child)
             stack.append(child)
@@ -190,6 +164,7 @@ def _run_script(
     timeout: int = DEFAULT_MONITOR_TIMEOUT_SECONDS,
     worker_pids: list[str] | None = None,
     related_pids: set[str] | None = None,
+    service_pids: list[str] | None = None,
 ) -> float:
     started = time.monotonic()
     try:
@@ -197,12 +172,14 @@ def _run_script(
         if device_info:
             args.append(device_info)
         env = None
-        if worker_pids is not None or related_pids is not None:
+        if worker_pids is not None or related_pids is not None or service_pids is not None:
             env = os.environ.copy()
             if worker_pids is not None:
                 env["AUTOPERF_MONITOR_PIDS"] = _format_pid_csv(worker_pids)
             if related_pids is not None:
                 env["AUTOPERF_MONITOR_RELATED_PIDS"] = _format_pid_csv(related_pids)
+            if service_pids is not None:
+                env["AUTOPERF_SERVICE_PIDS"] = _format_pid_csv(service_pids)
         result = subprocess.run(
             args,
             stdout=subprocess.PIPE,
@@ -237,7 +214,14 @@ def _run_monitor_scripts(
     timeout: int = DEFAULT_MONITOR_TIMEOUT_SECONDS,
 ) -> dict[str, float]:
     field_by_script = dict(zip(SCRIPT_NAMES, CSV_FIELDS[1:]))
-    worker_pids, related_pids = _discover_monitor_pids(container, workers)
+    try:
+        rows = _docker_top_rows(container)
+        worker_pids = _select_worker_pids(rows, workers)
+        related_pids = _select_related_pids(rows, workers)
+        service_pids = worker_pids
+    except Exception as exc:
+        _warn_throttled(logger, f"{container}:discovery", f"Failed to discover service PIDs: {container}: {exc}")
+        worker_pids, related_pids, service_pids = [], set(), []
     with ThreadPoolExecutor(max_workers=len(SCRIPT_NAMES)) as executor:
         futures = {
             name: executor.submit(
@@ -250,6 +234,7 @@ def _run_monitor_scripts(
                 timeout,
                 worker_pids,
                 related_pids,
+                service_pids,
             )
             for name in SCRIPT_NAMES
         }
@@ -283,8 +268,7 @@ class MonitorLoop:
 
     def start(self) -> None:
         validate_monitor_scripts(self.script_dir)
-        if not self.device_info:
-            self.device_info = discover_npu_devices(self.container, self.workers, self.logger)
+        # NPU samplers refresh process/chip associations on every sample.
         self.csv_file.parent.mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(target=self._run, name="autoperf-monitor", daemon=True)
         self._thread.start()
@@ -354,5 +338,4 @@ def run_monitor_once(
     timeout: int = DEFAULT_MONITOR_TIMEOUT_SECONDS,
 ) -> dict[str, float]:
     validate_monitor_scripts(script_dir)
-    device_info = discover_npu_devices(container, workers, logger)
-    return _run_monitor_scripts(script_dir, container, workers, device_info, logger, timeout)
+    return _run_monitor_scripts(script_dir, container, workers, "", logger, timeout)

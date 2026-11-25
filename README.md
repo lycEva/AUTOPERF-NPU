@@ -211,7 +211,7 @@ autoperf update-scripts \
 | 参数 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `--container` | 是 | - | 已经启动好的被压测服务 Docker 容器名。 |
-| `--workers` | 是 | - | 当前服务实际运行的 worker 进程数，只用于监控脚本选择服务 PID，不会修改服务配置。 |
+| `--workers` | 是 | - | 当前服务 worker 数，用于运行配置记录及旧命令兼容；监控自动采集完整服务进程树，不按此数量截断，不会修改服务配置。 |
 | `--jmx` | 否 | `templates/base.jmx` | JMeter JMX 模板或测试计划路径。工具会复制并修改副本，不修改原文件。 |
 | `--threads` | 是 | - | JMeter 并发线程数，不是服务 worker 数。 |
 | `--duration` | 是 | - | 预热结束后的正式测量时长，单位秒；JMeter 总施压时长为该值加 `--warmup`。 |
@@ -334,7 +334,7 @@ AI 配置参数如下：
 | 脚本 | 指标 | CSV 字段 | 单位 |
 |---|---|---|---|
 | `run_cpu.sh` | CPU 使用率 | `cpu_usage` | `%` |
-| `run_mem.sh` | 内存占用 | `mem_usage` | GB |
+| `run_mem.sh` | 服务进程树 RSS 汇总 | `mem_usage` | GiB |
 | `run_npu_usage.sh` | NPU AICore 使用率 | `npu_usage` | `%` |
 | `run_npu_mem.sh` | NPU 显存占用 | `npu_mem` | MiB |
 
@@ -344,8 +344,22 @@ AI 配置参数如下：
 
 - 通过参数接收容器名，不写死容器名或 PID
 - stdout 只输出一个数字
-- 异常时输出 `0`
-- CLI 调用时优先读取 `AUTOPERF_MONITOR_PIDS` 和 `AUTOPERF_MONITOR_RELATED_PIDS`
+- 采样失败时向 stderr 输出原因并以非零状态退出；CLI 记录 warning，当前 CSV 兼容逻辑仍将失败指标写成 `0`
+- CPU/内存使用 `python3 -m autoperf.process_metrics`，不依赖 `npu-smi` 或显存；NPU 使用 `python3 -m autoperf.npu_metrics`，通过 `npu-smi` 查询；均需在当前 Python 环境中安装本组件
+- 四项指标均优先读取 `AUTOPERF_SERVICE_PIDS`（宿主机 PID，逗号分隔），兼容 `AUTOPERF_MONITOR_PIDS`；显式指定 PID 后可不提供容器名
+- 自动发现优先选择顶层 Gunicorn 服务进程（包括空闲 master），其他服务使用容器内进程树根；递归采集全部子进程，不以 worker 数截断，不按进程名称过滤子进程
+- 四项指标每次采样都重新展开服务进程树；NPU 不再使用基于 CPU 活跃度、Gunicorn 子进程名或 worker 数量的过滤
+
+CPU 使用率 = `ΣΔ(utime + stime) / CLK_TCK / 实际采样秒数 × 100%`，单核满载为 100%，多进程、多核时可超过 100%。默认 CPU 采样窗口为 1 秒，可用 `CPU_SAMPLE_SECONDS` 调整。采集时按 PID 和启动时间识别进程，重叠进程树去重，不计入父进程的子进程累计时间，避免重复统计。
+
+内存为服务进程树各进程 RSS 之和，换算为 GiB（`RSS_KiB / 1024²`）。按 RSS 求和时，各进程共享页会分别计入；该指标不是去重物理内存或 PSS。
+
+只按服务 PID 采样的示例（无须 Docker 或 NPU）：
+
+```bash
+AUTOPERF_SERVICE_PIDS=1234,5678 bash scripts/run_cpu.sh
+AUTOPERF_SERVICE_PIDS=1234,5678 bash scripts/run_mem.sh
+```
 
 ## 配置文件
 
@@ -410,9 +424,11 @@ autoperf run-existing \
 后续生成的综合 Markdown、HTML 报告及 `metrics.json` 也会包含依赖容器指标，
 其中主服务保持在 `monitor`，依赖服务记录在 `container_monitors`，按容器名区分。
 
-指标沿用现有采集口径：CPU、内存取所选 worker 的最大值，NPU 显存取匹配进程的最大值，
-并非容器总量。NPU 利用率取关联芯片的最大利用率；两个服务共享芯片时可能显示相同的利用率，
-不能将该数值直接视作单个容器独占的 NPU 利用率，也不应把两者相加。
+CPU 汇总服务进程树的 CPU 时间增量，内存汇总同一进程树的 RSS，不依赖 NPU 进程或显存。
+NPU 显存按完整服务进程树与 `npu-smi info` 的进程表关联，以 `(卡 ID, 芯片 ID, PID)` 去重后求和，保留同一 PID 跨芯片的独立记录。
+NPU 利用率为关联芯片的 AICore 利用率之和：同一芯片上多个服务进程只计一次，多芯片汇总可超过 100%。它不是显存容量占用率，也不是逐进程的独占计算利用率。
+设备关联每次采样刷新，服务未使用 NPU 时返回 `0`，不会回退采集整机所有芯片。显式传入的设备列表仅作进一步筛选，不扩大到服务未关联的芯片。
+两个服务共享芯片时可能采到相同的芯片利用率，不能把两份服务报告中的数值相加作为整机利用率。
 
 单次检查两个容器的采集可使用：
 

@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "autoLoad": true,
+  "contextBudget": 6000,
+  "environments": [],
+  "defaultEnvironment": null
+}

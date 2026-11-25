@@ -22,7 +22,8 @@ class MultiContainerMonitorTest(unittest.TestCase):
         for command in ("run", "run-existing"):
             argv = [command, "--container", "service-a", "--threads", "2", "--duration", "10", "--output", "results"]
             if command == "run":
-                argv += ["--server-name", "a", "--server-config", "server.json", "--service-workers", "3", "--service-threads", "4"]
+                argv += ["--server-name", "a", "--server-config", "server.json", "--service-workers", "3", "--service-threads", "4",
+                         "--container-config-dir", "/hexapp/ai-a-serving/conf"]
             else:
                 argv += ["--workers", "3"]
             args = build_parser().parse_args(argv)
